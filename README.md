@@ -7,6 +7,9 @@ No cloud AI APIs, Microsoft AI credits, Copilot, OpenAI API credits, or paid rem
 ## Files
 
 - `NotepadMarkdownAssistant.ps1` - tray app, global hotkeys, and popup mode menu.
+- `Launch-Assistant.vbs` - double-click launcher that starts the tray app with no visible PowerShell window.
+- `Install-AssistantShortcuts.ps1` - optional helper to create Desktop or Startup shortcuts to the hidden launcher.
+- `Uninstall-AssistantShortcuts.ps1` - optional helper to remove those shortcuts.
 - `Start-LlamaServer.ps1` - starts the local `llama-server.exe` with the configured GGUF model.
 - `Test-Assistant.ps1` - validates paths and optionally checks the local server.
 - `Unblock-LlamaCpp.ps1` - optional helper for removing Windows download-blocking marks from the local llama.cpp install.
@@ -50,13 +53,35 @@ If validation warns that `llama-server.exe` has a `Zone.Identifier` download mar
 
 ## Run
 
-Option A, simplest: let the assistant start `llama-server` hidden when first used:
+Option A, tray-only: double-click:
+
+```text
+Launch-Assistant.vbs
+```
+
+This starts the assistant hidden in the background. No PowerShell window stays open. The assistant appears only as a tray icon.
+
+Option B, create a normal Windows shortcut:
+
+```powershell
+.\Install-AssistantShortcuts.ps1 -Desktop
+```
+
+Then launch it from the `Local Text Formatting Assistant` shortcut on your Desktop.
+
+To also start the assistant automatically when you sign in:
+
+```powershell
+.\Install-AssistantShortcuts.ps1 -Startup
+```
+
+Option C, diagnostic mode: run with a visible PowerShell console so you can see timing logs and errors:
 
 ```powershell
 .\NotepadMarkdownAssistant.ps1
 ```
 
-Option B, more visible: start the server yourself in one PowerShell window:
+Option D, more visible server debugging: start the server yourself in one PowerShell window:
 
 ```powershell
 .\Start-LlamaServer.ps1
@@ -244,6 +269,16 @@ If you accidentally launch the assistant twice, the second copy shows an "alread
 
 The assistant continues running when only some hotkeys fail. Startup warnings list which shortcuts could not be registered.
 
+### Hidden launcher started but no tray icon appears
+
+Run diagnostic mode once:
+
+```powershell
+.\NotepadMarkdownAssistant.ps1
+```
+
+The console will show startup errors such as a blocked script, missing model, missing `llama-server.exe`, or a hotkey conflict.
+
 ### Clipboard behavior
 
 The assistant snapshots the clipboard before copying the selection and restores it after pasting. Most normal clipboard contents are preserved. Some apps with unusual delayed-render clipboard data may not restore perfectly, which is the main tradeoff of supporting standard Windows apps without app-specific plugins.
@@ -256,7 +291,13 @@ The preview window appears after generation and before paste. It only shows the 
 
 1. Right-click the tray icon and choose `Exit`.
 2. Close the `llama-server` PowerShell window if you started it manually.
-3. Delete this project folder, or delete only the assistant files listed above.
+3. If you created shortcuts, run:
+
+```powershell
+.\Uninstall-AssistantShortcuts.ps1
+```
+
+4. Delete this project folder, or delete only the assistant files listed above.
 
 ## Chosen approach
 

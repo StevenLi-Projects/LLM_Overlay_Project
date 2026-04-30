@@ -50,11 +50,22 @@ if ($config.llama.PSObject.Properties.Name -contains "server_args") {
     $serverArgsValid = ($null -ne $config.llama.server_args)
 }
 $profilesValid = $true
+$activeProfileValid = $true
+$profileSwitchingValid = $true
 if ($config.llama.PSObject.Properties.Name -contains "profiles") {
+    $profileNames = @($config.llama.profiles.PSObject.Properties | ForEach-Object { $_.Name })
+    $activeProfileValid = $profileNames -contains $activeProfile
+    $profileSwitchingValid = ($profileNames -contains "normal") -and ($profileNames -contains "fast")
+
     foreach ($profile in $config.llama.profiles.PSObject.Properties) {
         $profilesValid = $profilesValid -and
             ($profile.Value.PSObject.Properties.Name -contains "model_path") -and
             (Test-Path -LiteralPath $profile.Value.model_path)
+
+        $profileSwitchingValid = $profileSwitchingValid -and
+            ($profile.Value.PSObject.Properties.Name -contains "model_name") -and
+            ($profile.Value.PSObject.Properties.Name -contains "context_size") -and
+            ([int]$profile.Value.context_size -gt 0)
     }
 }
 $checks = @(
@@ -69,6 +80,8 @@ $checks = @(
     @{ Name = "health cache setting exists"; Passed = ($config.llama.PSObject.Properties.Name -contains "health_cache_sec"); Detail = "llama.health_cache_sec" },
     @{ Name = "server args setting is valid"; Passed = $serverArgsValid; Detail = "llama.server_args" },
     @{ Name = "model profiles are valid"; Passed = $profilesValid; Detail = "llama.profiles.*.model_path" },
+    @{ Name = "active profile is valid"; Passed = $activeProfileValid; Detail = "llama.active_profile" },
+    @{ Name = "normal/fast profile switching is configured"; Passed = $profileSwitchingValid; Detail = "llama.profiles.normal + llama.profiles.fast" },
     @{ Name = "mode max token settings are valid"; Passed = $modeTokenSettingsValid; Detail = "modes.*.max_tokens" },
     @{ Name = "at least one mode enabled"; Passed = (($config.modes.PSObject.Properties | Where-Object { $_.Value.enabled }).Count -gt 0); Detail = "" }
 )
