@@ -2,7 +2,7 @@
 
 This is a local-first Windows helper for formatting selected editable text with a local `llama.cpp` model. It works in standard Windows Notepad and many other Windows apps that support normal `Ctrl+C` and `Ctrl+V` editing. It copies the current selection, sends it to a locally running `llama-server`, previews the proposed replacement, pastes the approved Markdown back over the selection, then restores the previous clipboard contents.
 
-No cloud AI APIs, Microsoft AI credits, Copilot, OpenAI API credits, or paid remote services are used.
+The app runs locally using a local LLM. 
 
 ## Files
 
