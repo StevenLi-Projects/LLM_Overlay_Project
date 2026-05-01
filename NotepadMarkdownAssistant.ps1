@@ -191,6 +191,33 @@ function Get-PropertyValue {
     return $Default
 }
 
+function Get-PropertyDouble {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [double]$Default = 0.0
+    )
+    $value = Get-PropertyValue -Object $Object -Name $Name -Default $null
+    if ($null -eq $value) { return $Default }
+    try {
+        return [double]$value
+    } catch {
+        return $Default
+    }
+}
+
+function Get-LlamaResponseTimings {
+    param([object]$Response)
+
+    $timings = Get-PropertyValue -Object $Response -Name "timings" -Default $null
+    return [pscustomobject]@{
+        PromptMs = Get-PropertyDouble -Object $timings -Name "prompt_ms" -Default 0.0
+        PromptTps = Get-PropertyDouble -Object $timings -Name "prompt_per_second" -Default 0.0
+        PredictedMs = Get-PropertyDouble -Object $timings -Name "predicted_ms" -Default 0.0
+        PredictedTps = Get-PropertyDouble -Object $timings -Name "predicted_per_second" -Default 0.0
+    }
+}
+
 function Get-ConfigInt {
     param(
         [object]$Object,
@@ -352,13 +379,39 @@ function Get-ModeMaxTokens {
 function Get-LlamaServerArgs {
     param([object]$Config)
 
+    $configuredGpuLayers = Get-ConfigInt -Object $Config.llama -Name "gpu_layers" -Default 0
+    $preferGpu = Get-ConfigBool -Object $Config.llama -Name "prefer_gpu" -Default ($configuredGpuLayers -gt 0)
+    $requireGpu = Get-ConfigBool -Object $Config.llama -Name "require_gpu" -Default $false
+    $gpuAvailable = $false
+    if ($preferGpu -or $requireGpu) {
+        $gpuAvailable = Test-LlamaGpuAvailable -Config $Config
+    }
+    if ($requireGpu -and !$gpuAvailable) {
+        throw "GPU is required, but this llama.cpp build currently reports no GPU devices. Run '.\Diagnose-LlamaGpu.ps1'. Set llama.require_gpu to false to allow CPU fallback."
+    }
+
+    $effectiveGpuLayers = 0
+    if ($preferGpu -and $gpuAvailable) {
+        $effectiveGpuLayers = $configuredGpuLayers
+    }
+
     $args = @(
         "--model", $Config.llama.model_path,
+        "--alias", $Config.llama.model_name,
         "--host", $Config.llama.host,
         "--port", ([string]$Config.llama.port),
         "--ctx-size", ([string]$Config.llama.context_size),
-        "--n-gpu-layers", ([string]$Config.llama.gpu_layers)
+        "--n-gpu-layers", ([string]$effectiveGpuLayers)
     )
+
+    if ($preferGpu -and $gpuAvailable -and $effectiveGpuLayers -gt 0) {
+        $gpuDevice = [string](Get-PropertyValue -Object $Config.llama -Name "gpu_device" -Default "")
+        if (![string]::IsNullOrWhiteSpace($gpuDevice)) {
+            $args += @("--device", $gpuDevice)
+        }
+    } elseif ($preferGpu -and !$gpuAvailable) {
+        Write-Warning "No llama.cpp GPU device detected; starting with CPU fallback."
+    }
 
     $extraArgs = Get-PropertyValue -Object $Config.llama -Name "server_args" -Default @()
     foreach ($arg in $extraArgs) {
@@ -370,58 +423,108 @@ function Get-LlamaServerArgs {
     return $args
 }
 
+function Test-LlamaGpuAvailable {
+    param([object]$Config)
+
+    $exe = Join-Path $Config.llama.cpp_dir "llama-server.exe"
+    if (!(Test-Path -LiteralPath $exe)) { return $false }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $exe --list-devices 2>&1 | Out-String
+        return ($output -match "(?i)Device\s+\d+:\s+.*(CUDA|NVIDIA|GeForce|RTX|Vulkan|SYCL|Metal)")
+    } catch {
+        Write-Warning "Could not query llama.cpp devices: $($_.Exception.Message)"
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+function Assert-LlamaGpuAvailable {
+    param([object]$Config)
+
+    $gpuLayers = Get-ConfigInt -Object $Config.llama -Name "gpu_layers" -Default 0
+    $requireGpu = Get-ConfigBool -Object $Config.llama -Name "require_gpu" -Default $false
+    if (!$requireGpu -or $gpuLayers -le 0) { return }
+
+    if (!(Test-LlamaGpuAvailable -Config $Config)) {
+        throw "GPU is required, but this llama.cpp build currently reports no GPU devices. Run '.\Diagnose-LlamaGpu.ps1'. Set llama.require_gpu to false to allow CPU fallback."
+    }
+}
+
 function Clear-LlamaHealthCache {
     $script:llamaHealthConfirmedAt = [DateTime]::MinValue
 }
 
-function Get-ConfiguredModelPaths {
+function Get-LlamaServerExePath {
+    param([object]$Config)
+    return [System.IO.Path]::GetFullPath((Join-Path $Config.llama.cpp_dir "llama-server.exe"))
+}
+
+function Get-ConfiguredPortListenerProcessIds {
     param([object]$Config)
 
-    $paths = @()
-    if ($Config.llama.PSObject.Properties.Name -contains "model_path") {
-        $paths += [string]$Config.llama.model_path
-    }
-    if ($Config.llama.PSObject.Properties.Name -contains "profiles") {
-        foreach ($profile in $Config.llama.profiles.PSObject.Properties) {
-            if ($profile.Value.PSObject.Properties.Name -contains "model_path") {
-                $paths += [string]$profile.Value.model_path
+    $port = [int]$Config.llama.port
+    $ids = @()
+    try {
+        $lines = netstat -ano -p TCP 2>$null
+        foreach ($line in $lines) {
+            if ($line -match "^\s*TCP\s+.+:$port\s+\S+\s+LISTENING\s+(\d+)\s*$") {
+                $ids += [int]$matches[1]
             }
         }
+    } catch {
+        Write-Warning "Could not inspect TCP listeners: $($_.Exception.Message)"
     }
-    return @($paths | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    return @($ids | Select-Object -Unique)
+}
+
+function Test-ProcessIsLlamaServer {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [object]$Config
+    )
+
+    if (!$Process) { return $false }
+    if ($Process.ProcessName -ne "llama-server") { return $false }
+
+    $expectedExe = Get-LlamaServerExePath -Config $Config
+    try {
+        if ($Process.Path) {
+            $actualExe = [System.IO.Path]::GetFullPath($Process.Path)
+            return [string]::Equals($actualExe, $expectedExe, [StringComparison]::OrdinalIgnoreCase)
+        }
+    } catch { }
+
+    return $true
+}
+
+function Stop-LlamaServerOnConfiguredPort {
+    param([object]$Config)
+
+    foreach ($processId in Get-ConfiguredPortListenerProcessIds -Config $Config) {
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if (!$process) { continue }
+        if (Test-ProcessIsLlamaServer -Process $process -Config $Config) {
+            try {
+                Stop-Process -Id $processId -Force -ErrorAction Stop
+                Start-Sleep -Milliseconds 300
+            } catch {
+                Write-Warning "Could not stop llama-server process $processId on port $($Config.llama.port): $($_.Exception.Message)"
+            }
+        } else {
+            throw "Port $($Config.llama.port) is already in use by process $processId ($($process.ProcessName)). Change llama.port/server_url or stop that process."
+        }
+    }
 }
 
 function Stop-ConfiguredLlamaServers {
     param([object]$Config)
 
-    $models = Get-ConfiguredModelPaths -Config $Config
-    if ($models.Count -eq 0) { return }
-
-    try {
-        $servers = Get-CimInstance Win32_Process -Filter "name = 'llama-server.exe'" -ErrorAction Stop
-    } catch {
-        Write-Warning "Could not inspect llama-server command lines: $($_.Exception.Message)"
-        Stop-OwnedLlamaServers
-        return
-    }
-
-    foreach ($server in $servers) {
-        $commandLine = [string](Get-PropertyValue -Object $server -Name "CommandLine" -Default "")
-        $matchesModel = $false
-        foreach ($model in $models) {
-            if ($commandLine.IndexOf($model, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $matchesModel = $true
-                break
-            }
-        }
-        if ($matchesModel) {
-            try {
-                Stop-Process -Id $server.ProcessId -Force -ErrorAction Stop
-            } catch {
-                Write-Warning "Could not stop llama-server process $($server.ProcessId): $($_.Exception.Message)"
-            }
-        }
-    }
+    Stop-OwnedLlamaServers
+    Stop-LlamaServerOnConfiguredPort -Config $Config
     Clear-LlamaHealthCache
     $script:serverModelPath = $null
 }
@@ -506,6 +609,7 @@ function Invoke-Llama {
         temperature = [double]$Config.generation.temperature
         top_p = [double]$Config.generation.top_p
         n_predict = $MaxTokens
+        cache_prompt = $true
         stream = $false
     } | ConvertTo-Json -Depth 5
 
@@ -516,11 +620,16 @@ function Invoke-Llama {
         try {
             $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/completion" -ContentType "application/json" -Body $completionBody -TimeoutSec $timeoutSec
             if ($response.content -and ![string]::IsNullOrWhiteSpace($response.content)) {
+                $timings = Get-LlamaResponseTimings -Response $response
                 return [pscustomobject]@{
                     Text = $response.content.Trim()
                     Endpoint = "completion"
                     TokensPredicted = [int](Get-PropertyValue -Object $response -Name "tokens_predicted" -Default 0)
                     TokensEvaluated = [int](Get-PropertyValue -Object $response -Name "tokens_evaluated" -Default 0)
+                    PromptMs = $timings.PromptMs
+                    PromptTps = $timings.PromptTps
+                    PredictedMs = $timings.PredictedMs
+                    PredictedTps = $timings.PredictedTps
                 }
             }
             $completionError = "empty response"
@@ -538,6 +647,10 @@ function Invoke-Llama {
                     Endpoint = "chat"
                     TokensPredicted = [int](Get-PropertyValue -Object $usage -Name "completion_tokens" -Default 0)
                     TokensEvaluated = [int](Get-PropertyValue -Object $usage -Name "prompt_tokens" -Default 0)
+                    PromptMs = 0.0
+                    PromptTps = 0.0
+                    PredictedMs = 0.0
+                    PredictedTps = 0.0
                 }
             }
             $chatError = "empty response"
@@ -555,6 +668,10 @@ function Invoke-Llama {
                     Endpoint = "chat"
                     TokensPredicted = [int](Get-PropertyValue -Object $usage -Name "completion_tokens" -Default 0)
                     TokensEvaluated = [int](Get-PropertyValue -Object $usage -Name "prompt_tokens" -Default 0)
+                    PromptMs = 0.0
+                    PromptTps = 0.0
+                    PredictedMs = 0.0
+                    PredictedTps = 0.0
                 }
             }
             $chatError = "empty response"
@@ -565,11 +682,16 @@ function Invoke-Llama {
         try {
             $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/completion" -ContentType "application/json" -Body $completionBody -TimeoutSec $timeoutSec
             if ($response.content -and ![string]::IsNullOrWhiteSpace($response.content)) {
+                $timings = Get-LlamaResponseTimings -Response $response
                 return [pscustomobject]@{
                     Text = $response.content.Trim()
                     Endpoint = "completion"
                     TokensPredicted = [int](Get-PropertyValue -Object $response -Name "tokens_predicted" -Default 0)
                     TokensEvaluated = [int](Get-PropertyValue -Object $response -Name "tokens_evaluated" -Default 0)
+                    PromptMs = $timings.PromptMs
+                    PromptTps = $timings.PromptTps
+                    PredictedMs = $timings.PredictedMs
+                    PredictedTps = $timings.PredictedTps
                 }
             }
             $completionError = "empty response"
@@ -589,6 +711,13 @@ function Test-LlamaServer {
     )
 
     $currentModelPath = [string](Get-PropertyValue -Object $Config.llama -Name "model_path" -Default "")
+    $preferGpu = Get-ConfigBool -Object $Config.llama -Name "prefer_gpu" -Default $false
+    $autoStart = Get-ConfigBool -Object $Config.llama -Name "auto_start_server" -Default $false
+    if (!$Force -and $preferGpu -and $autoStart -and !$script:serverModelPath) {
+        Clear-LlamaHealthCache
+        return $false
+    }
+
     if (!$Force -and $script:serverModelPath -and $currentModelPath -and
         $script:serverModelPath -ne $currentModelPath) {
         Clear-LlamaHealthCache
@@ -606,20 +735,44 @@ function Test-LlamaServer {
 
     $baseUrl = $Config.llama.server_url.TrimEnd("/")
     try {
-        Invoke-RestMethod -Method Get -Uri "$baseUrl/health" -TimeoutSec 2 | Out-Null
+        $props = Invoke-RestMethod -Method Get -Uri "$baseUrl/props" -TimeoutSec 2
+        $serverModelPath = [string](Get-PropertyValue -Object $props -Name "model_path" -Default "")
+        $serverAlias = [string](Get-PropertyValue -Object $props -Name "model_alias" -Default "")
+        if (![string]::IsNullOrWhiteSpace($serverAlias) -and
+            ![string]::Equals($serverAlias, [string]$Config.llama.model_name, [StringComparison]::OrdinalIgnoreCase)) {
+            Clear-LlamaHealthCache
+            return $false
+        }
+        if (![string]::IsNullOrWhiteSpace($serverModelPath) -and
+            ![string]::Equals(
+                [System.IO.Path]::GetFullPath($serverModelPath),
+                [System.IO.Path]::GetFullPath($currentModelPath),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            Clear-LlamaHealthCache
+            return $false
+        }
         $script:llamaHealthConfirmedAt = Get-Date
         $script:serverModelPath = $currentModelPath
         return $true
     } catch {
         try {
-            Invoke-RestMethod -Method Get -Uri "$baseUrl/v1/models" -TimeoutSec 2 | Out-Null
-            $script:llamaHealthConfirmedAt = Get-Date
-            $script:serverModelPath = $currentModelPath
-            return $true
+            $models = Invoke-RestMethod -Method Get -Uri "$baseUrl/v1/models" -TimeoutSec 2
+            $expectedName = [System.IO.Path]::GetFileName($currentModelPath)
+            $expectedAlias = [string]$Config.llama.model_name
+            $modelIds = @()
+            if ($models.data) { $modelIds += @($models.data | ForEach-Object { [string]$_.id }) }
+            if ($models.models) { $modelIds += @($models.models | ForEach-Object { [string]$_.model }) }
+            if (($modelIds -contains $expectedName) -or ($modelIds -contains $expectedAlias)) {
+                $script:llamaHealthConfirmedAt = Get-Date
+                $script:serverModelPath = $currentModelPath
+                return $true
+            }
         } catch {
             Clear-LlamaHealthCache
             return $false
         }
+        Clear-LlamaHealthCache
+        return $false
     }
 }
 
@@ -635,6 +788,7 @@ function Start-LlamaServerIfNeeded {
     if (!(Test-Path -LiteralPath $exe)) { throw "llama-server.exe not found: $exe" }
     if (!(Test-Path -LiteralPath $Config.llama.model_path)) { throw "Model not found: $($Config.llama.model_path)" }
 
+    Assert-LlamaGpuAvailable -Config $Config
     Stop-ConfiguredLlamaServers -Config $Config
     $args = Get-LlamaServerArgs -Config $Config
 
@@ -646,6 +800,9 @@ function Start-LlamaServerIfNeeded {
     $deadline = (Get-Date).AddSeconds([int]$Config.llama.startup_wait_sec)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
+        if ($process -and $process.HasExited) {
+            throw "llama-server exited before becoming ready. The port may be occupied, the model may have failed to load, or CUDA startup failed."
+        }
         if (Test-LlamaServer $Config -Force) { return }
     }
 
@@ -732,7 +889,6 @@ function Wait-ModifierKeysReleased {
 
 function Show-ReplacementPreview {
     param(
-        [string]$OriginalText,
         [string]$ReplacementText,
         [string]$Mode,
         [string]$TelemetryText = ""
@@ -891,8 +1047,10 @@ function Write-TimingDiagnostics {
     if ($Telemetry) {
         if ($Telemetry.Endpoint) { $parts += "endpoint=$($Telemetry.Endpoint)" }
         if ($Telemetry.TokensPredicted -gt 0) { $parts += "tokens=$($Telemetry.TokensPredicted)" }
-        if ($Telemetry.Tps -gt 0) { $parts += ("tps={0:N1}" -f $Telemetry.Tps) }
+        if ($Telemetry.Tps -gt 0) { $parts += ("decode_tps={0:N1}" -f $Telemetry.Tps) }
+        if ($Telemetry.WallTps -gt 0) { $parts += ("wall_tps={0:N1}" -f $Telemetry.WallTps) }
         if ($Telemetry.TokensEvaluated -gt 0) { $parts += "prompt_tokens=$($Telemetry.TokensEvaluated)" }
+        if ($Telemetry.PromptTps -gt 0) { $parts += ("prompt_tps={0:N1}" -f $Telemetry.PromptTps) }
     }
     Write-Host "[Timing][$Mode] $($parts -join ', ')"
 }
@@ -912,8 +1070,10 @@ function Format-TelemetryText {
     if ($Telemetry.Endpoint) { $parts += "endpoint: $($Telemetry.Endpoint)" }
     if ($GenerationMs -gt 0) { $parts += ("generation: {0:N1}s" -f ($GenerationMs / 1000.0)) }
     if ($Telemetry.TokensPredicted -gt 0) { $parts += "output tokens: $($Telemetry.TokensPredicted)" }
-    if ($Telemetry.Tps -gt 0) { $parts += ("TPS: {0:N1}" -f $Telemetry.Tps) }
+    if ($Telemetry.Tps -gt 0) { $parts += ("decode TPS: {0:N1}" -f $Telemetry.Tps) }
+    if ($Telemetry.WallTps -gt 0 -and [math]::Abs($Telemetry.WallTps - $Telemetry.Tps) -gt 1.0) { $parts += ("wall TPS: {0:N1}" -f $Telemetry.WallTps) }
     if ($Telemetry.TokensEvaluated -gt 0) { $parts += "prompt tokens: $($Telemetry.TokensEvaluated)" }
+    if ($Telemetry.PromptTps -gt 0) { $parts += ("prompt TPS: {0:N0}" -f $Telemetry.PromptTps) }
     $parts += "max output: $MaxTokens"
     return ($parts -join "   |   ")
 }
@@ -977,9 +1137,18 @@ function Invoke-FormatSelection {
             TokensPredicted = [int]$result.TokensPredicted
             TokensEvaluated = [int]$result.TokensEvaluated
             Tps = 0.0
+            WallTps = 0.0
+            PromptTps = [double]$result.PromptTps
+            PromptMs = [double]$result.PromptMs
+            PredictedMs = [double]$result.PredictedMs
         }
         if ($telemetry.TokensPredicted -gt 0 -and $timings.generation -gt 0) {
-            $telemetry.Tps = $telemetry.TokensPredicted / ($timings.generation / 1000.0)
+            $telemetry.WallTps = $telemetry.TokensPredicted / ($timings.generation / 1000.0)
+        }
+        if ([double]$result.PredictedTps -gt 0) {
+            $telemetry.Tps = [double]$result.PredictedTps
+        } elseif ($telemetry.WallTps -gt 0) {
+            $telemetry.Tps = $telemetry.WallTps
         }
 
         if ([string]::IsNullOrWhiteSpace($output)) {
@@ -995,7 +1164,7 @@ function Invoke-FormatSelection {
         $telemetryText = Format-TelemetryText -Telemetry $telemetry -GenerationMs $timings.generation -MaxTokens $maxTokens
         if ($previewEnabled) {
             $stageSw.Restart()
-            $previewOutput = Show-ReplacementPreview -OriginalText $selected -ReplacementText $output -Mode $Mode -TelemetryText $telemetryText
+            $previewOutput = Show-ReplacementPreview -ReplacementText $output -Mode $Mode -TelemetryText $telemetryText
             $stageSw.Stop()
             $timings.preview = $stageSw.ElapsedMilliseconds
             if ($null -eq $previewOutput) {

@@ -49,6 +49,31 @@ $serverArgsValid = $true
 if ($config.llama.PSObject.Properties.Name -contains "server_args") {
     $serverArgsValid = ($null -ne $config.llama.server_args)
 }
+$requireGpu = $false
+if ($config.llama.PSObject.Properties.Name -contains "require_gpu") {
+    $requireGpu = [bool]$config.llama.require_gpu
+}
+$preferGpu = $false
+if ($config.llama.PSObject.Properties.Name -contains "prefer_gpu") {
+    $preferGpu = [bool]$config.llama.prefer_gpu
+}
+$gpuAvailable = $true
+$gpuDetail = "GPU not required"
+if ($requireGpu -or $preferGpu) {
+    try {
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $deviceOutput = & $serverExe --list-devices 2>&1 | Out-String
+        $gpuAvailable = ($deviceOutput -match "(?i)Device\s+\d+:\s+.*(CUDA|NVIDIA|GeForce|RTX|Vulkan|SYCL|Metal)")
+        $gpuDetail = "llama-server --list-devices"
+    } catch {
+        $gpuAvailable = $false
+        $gpuDetail = $_.Exception.Message
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+$gpuPolicyValid = (!$requireGpu -or $gpuAvailable)
 $profilesValid = $true
 $activeProfileValid = $true
 $profileSwitchingValid = $true
@@ -79,6 +104,8 @@ $checks = @(
     @{ Name = "timing notification setting exists"; Passed = ($config.ui.PSObject.Properties.Name -contains "show_timing_notifications"); Detail = "ui.show_timing_notifications" },
     @{ Name = "health cache setting exists"; Passed = ($config.llama.PSObject.Properties.Name -contains "health_cache_sec"); Detail = "llama.health_cache_sec" },
     @{ Name = "server args setting is valid"; Passed = $serverArgsValid; Detail = "llama.server_args" },
+    @{ Name = "GPU preference setting exists"; Passed = ($config.llama.PSObject.Properties.Name -contains "prefer_gpu"); Detail = "llama.prefer_gpu" },
+    @{ Name = "GPU policy is valid"; Passed = $gpuPolicyValid; Detail = $gpuDetail },
     @{ Name = "model profiles are valid"; Passed = $profilesValid; Detail = "llama.profiles.*.model_path" },
     @{ Name = "active profile is valid"; Passed = $activeProfileValid; Detail = "llama.active_profile" },
     @{ Name = "normal/fast profile switching is configured"; Passed = $profileSwitchingValid; Detail = "llama.profiles.normal + llama.profiles.fast" },

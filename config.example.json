@@ -23,6 +23,9 @@
     "server_url": "http://127.0.0.1:8080",
     "context_size": 8192,
     "gpu_layers": 999,
+    "prefer_gpu": true,
+    "require_gpu": false,
+    "gpu_device": "CUDA0",
     "auto_start_server": true,
     "startup_wait_sec": 90,
     "health_cache_sec": 30,
@@ -30,6 +33,10 @@
       "--flash-attn",
       "auto",
       "--cache-prompt",
+      "--threads",
+      "8",
+      "--threads-batch",
+      "8",
       "--parallel",
       "1"
     ]

@@ -62,13 +62,39 @@ function Apply-LlamaProfile {
 function Get-LlamaServerArgs {
     param([object]$Config)
 
+    $configuredGpuLayers = Get-ConfigInt -Object $Config.llama -Name "gpu_layers" -Default 0
+    $preferGpu = Get-ConfigBool -Object $Config.llama -Name "prefer_gpu" -Default ($configuredGpuLayers -gt 0)
+    $requireGpu = Get-ConfigBool -Object $Config.llama -Name "require_gpu" -Default $false
+    $gpuAvailable = $false
+    if ($preferGpu -or $requireGpu) {
+        $gpuAvailable = Test-LlamaGpuAvailable -Config $Config
+    }
+    if ($requireGpu -and !$gpuAvailable) {
+        throw "GPU is required, but this llama.cpp build currently reports no GPU devices. Run '.\Diagnose-LlamaGpu.ps1'. Set llama.require_gpu to false to allow CPU fallback."
+    }
+
+    $effectiveGpuLayers = 0
+    if ($preferGpu -and $gpuAvailable) {
+        $effectiveGpuLayers = $configuredGpuLayers
+    }
+
     $args = @(
         "--model", $Config.llama.model_path,
+        "--alias", $Config.llama.model_name,
         "--host", $Config.llama.host,
         "--port", ([string]$Config.llama.port),
         "--ctx-size", ([string]$Config.llama.context_size),
-        "--n-gpu-layers", ([string]$Config.llama.gpu_layers)
+        "--n-gpu-layers", ([string]$effectiveGpuLayers)
     )
+
+    if ($preferGpu -and $gpuAvailable -and $effectiveGpuLayers -gt 0) {
+        $gpuDevice = [string](Get-PropertyValue -Object $Config.llama -Name "gpu_device" -Default "")
+        if (![string]::IsNullOrWhiteSpace($gpuDevice)) {
+            $args += @("--device", $gpuDevice)
+        }
+    } elseif ($preferGpu -and !$gpuAvailable) {
+        Write-Warning "No llama.cpp GPU device detected; starting with CPU fallback."
+    }
 
     $extraArgs = Get-PropertyValue -Object $Config.llama -Name "server_args" -Default @()
     foreach ($arg in $extraArgs) {
@@ -78,6 +104,61 @@ function Get-LlamaServerArgs {
     }
 
     return $args
+}
+
+function Get-ConfigBool {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [bool]$Default
+    )
+    if ($Object -and ($Object.PSObject.Properties.Name -contains $Name)) {
+        return [bool]$Object.$Name
+    }
+    return $Default
+}
+
+function Get-ConfigInt {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [int]$Default
+    )
+    if ($Object -and ($Object.PSObject.Properties.Name -contains $Name)) {
+        return [int]$Object.$Name
+    }
+    return $Default
+}
+
+function Test-LlamaGpuAvailable {
+    param([object]$Config)
+
+    $exe = Join-Path $Config.llama.cpp_dir "llama-server.exe"
+    if (!(Test-Path -LiteralPath $exe)) { return $false }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $exe --list-devices 2>&1 | Out-String
+        return ($output -match "(?i)Device\s+\d+:\s+.*(CUDA|NVIDIA|GeForce|RTX|Vulkan|SYCL|Metal)")
+    } catch {
+        Write-Warning "Could not query llama.cpp devices: $($_.Exception.Message)"
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+function Assert-LlamaGpuAvailable {
+    param([object]$Config)
+
+    $gpuLayers = Get-ConfigInt -Object $Config.llama -Name "gpu_layers" -Default 0
+    $requireGpu = Get-ConfigBool -Object $Config.llama -Name "require_gpu" -Default $false
+    if (!$requireGpu -or $gpuLayers -le 0) { return }
+
+    if (!(Test-LlamaGpuAvailable -Config $Config)) {
+        throw "GPU is required, but this llama.cpp build currently reports no GPU devices. Run '.\Diagnose-LlamaGpu.ps1'. Set llama.require_gpu to false to allow CPU fallback."
+    }
 }
 
 if (!(Test-Path -LiteralPath $ConfigPath)) {
@@ -101,6 +182,7 @@ if ($config.llama.PSObject.Properties.Name -contains "profiles") {
 $exe = Join-Path $config.llama.cpp_dir "llama-server.exe"
 if (!(Test-Path -LiteralPath $exe)) { throw "llama-server.exe not found: $exe" }
 if (!(Test-Path -LiteralPath $config.llama.model_path)) { throw "Model not found: $($config.llama.model_path)" }
+Assert-LlamaGpuAvailable -Config $config
 
 $zone = Get-Item -LiteralPath $exe -Stream Zone.Identifier -ErrorAction SilentlyContinue
 if ($zone) {

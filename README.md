@@ -12,6 +12,7 @@ No cloud AI APIs, Microsoft AI credits, Copilot, OpenAI API credits, or paid rem
 - `Uninstall-AssistantShortcuts.ps1` - optional helper to remove those shortcuts.
 - `Start-LlamaServer.ps1` - starts the local `llama-server.exe` with the configured GGUF model.
 - `Test-Assistant.ps1` - validates paths and optionally checks the local server.
+- `Diagnose-LlamaGpu.ps1` - checks whether NVIDIA/CUDA is visible to llama.cpp.
 - `Unblock-LlamaCpp.ps1` - optional helper for removing Windows download-blocking marks from the local llama.cpp install.
 - `config.json` - active settings.
 - `config.example.json` - reset/reference settings.
@@ -126,7 +127,7 @@ Direct mode hotkeys:
 | Clean up without changing meaning | `Ctrl+Alt+C` |
 | Summarize into concise Markdown | `Ctrl+Alt+S` |
 
-After the model returns text, a compact preview window opens with only the editable replacement plus local telemetry such as endpoint, generation time, output tokens, and TPS when llama.cpp reports token counts. Choose `Replace` to paste it over the selected text or `Cancel` to leave the target app unchanged.
+After the model returns text, a compact preview window opens with only the editable replacement plus local telemetry such as endpoint, generation time, output tokens, decode TPS, wall TPS, and prompt TPS when llama.cpp reports timings. Choose `Replace` to paste it over the selected text or `Cancel` to leave the target app unchanged.
 
 For apps other than Notepad, the target field must support ordinary keyboard copy and paste. This includes many editors, browsers, email clients, chat boxes, and document fields. It will not replace text in read-only views, protected admin windows, password fields, or apps that block simulated keyboard input.
 
@@ -160,12 +161,19 @@ Important settings:
     "server_url": "http://127.0.0.1:8080",
     "context_size": 8192,
     "gpu_layers": 999,
+    "prefer_gpu": true,
+    "require_gpu": false,
+    "gpu_device": "CUDA0",
     "auto_start_server": true,
     "health_cache_sec": 30,
     "server_args": [
       "--flash-attn",
       "auto",
       "--cache-prompt",
+      "--threads",
+      "8",
+      "--threads-batch",
+      "8",
       "--parallel",
       "1"
     ]
@@ -203,13 +211,15 @@ To change the server port, change both `port` and `server_url`, for example:
 "server_url": "http://127.0.0.1:8081"
 ```
 
-To reduce GPU memory use, lower `gpu_layers`. To force CPU-only behavior, set it to `0`.
+To reduce GPU memory use, lower `gpu_layers`. To force CPU-only behavior, set `prefer_gpu` to `false` or set `gpu_layers` to `0`.
+
+`prefer_gpu` is enabled by default. The launcher checks `llama-server --list-devices`: when CUDA is visible it starts with `--device CUDA0` and the configured `gpu_layers`; when CUDA is not visible it starts with `--n-gpu-layers 0` as a CPU fallback. Set `require_gpu` to `true` only if you want the assistant to fail instead of falling back to CPU.
 
 For larger inputs and outputs, the default context is `8192`, the global generation cap is `2048`, and each mode has its own `max_tokens` cap. Lower these values if latency or VRAM use becomes uncomfortable.
 
 `generation.prefer_completion` uses llama.cpp's fast `/completion` endpoint first and keeps `/v1/chat/completions` as fallback.
 
-`llama.health_cache_sec` skips repeated server health probes after a recent successful check. `llama.server_args` are appended to the `llama-server.exe` command for both manual and auto-started servers.
+`llama.health_cache_sec` skips repeated server health probes after a recent successful check. `llama.server_args` are appended to the `llama-server.exe` command for both manual and auto-started servers. The default `--threads 8` and `--threads-batch 8` keep llama.cpp's CPU-side scheduling pool moderate while the model layers run on CUDA.
 
 To turn off the preview dialog and replace immediately, set `ui.preview_enabled` to `false`.
 
@@ -235,6 +245,35 @@ Run:
 
 Or set `"auto_start_server": true` in `config.json`.
 
+### GPU not used / CPU-only fallback
+
+Run:
+
+```powershell
+.\llama-b8987-bin-win-cuda-12.4-x64\llama-server.exe --list-devices
+```
+
+You should see a CUDA device. If it only shows CPU/RPC backends, llama.cpp cannot load its CUDA backend yet. `nvidia-smi` can still see your GPU while llama.cpp cannot use it if CUDA runtime/cuBLAS DLLs are missing from your PATH or from the llama.cpp folder.
+
+This project sets:
+
+```json
+"gpu_layers": 999,
+"prefer_gpu": true,
+"require_gpu": false,
+"gpu_device": "CUDA0"
+```
+
+With the default settings, the assistant uses GPU first and falls back to CPU if llama.cpp cannot see CUDA. If you want to refuse CPU fallback, set `require_gpu` to `true`. Install the missing CUDA runtime/cuBLAS DLLs or replace the llama.cpp folder with a CUDA Windows build that includes the required runtime DLLs, then re-run `.\Test-Assistant.ps1`.
+
+For a fuller local diagnosis, run:
+
+```powershell
+.\Diagnose-LlamaGpu.ps1
+```
+
+The common missing CUDA 12 DLLs are `cudart64_12.dll`, `cublas64_12.dll`, and `cublasLt64_12.dll`. Install them from NVIDIA's official CUDA Toolkit, then make sure they are either on PATH or copied into the same folder as `llama-server.exe`.
+
 If Windows cancels the launch or shows a download/security prompt for `llama-server.exe`, run:
 
 ```powershell
@@ -255,7 +294,9 @@ Increase `generation.timeout_sec`, reduce `generation.max_tokens`, or start with
 
 ### Latency tuning
 
-The assistant prints per-run timings to the PowerShell console, including server check, copy, generation, preview, paste, total milliseconds, endpoint, token counts, and TPS when available. Generation is usually the largest part. For faster responses, keep `llama-server` running, lower mode-specific `max_tokens`, or disable preview if you do not need confirmation.
+The assistant prints per-run timings to the PowerShell console, including server check, copy, generation, preview, paste, total milliseconds, endpoint, token counts, decode TPS, wall TPS, and prompt TPS when available. Decode TPS comes from llama.cpp's own `timings.predicted_per_second`; wall TPS includes prompt processing and HTTP overhead, so it can be much lower for large selections. For faster responses, keep `llama-server` running, lower mode-specific `max_tokens`, or disable preview if you do not need confirmation.
+
+If decode TPS is around CPU speeds, fully exit the tray assistant and relaunch it. The launcher validates the server alias/model and restarts the configured port so it does not silently reuse an old CPU-only server.
 
 ### Invalid or empty response
 
@@ -285,7 +326,7 @@ The assistant snapshots the clipboard before copying the selection and restores 
 
 ### Preview window
 
-The preview window appears after generation and before paste. It only shows the replacement text, not the original selection. `Replace` pastes the current preview text, including any manual edits. `Cancel` restores the clipboard snapshot and does not paste anything into the target app. The status line shows local telemetry such as generation time, output tokens, prompt tokens, endpoint, and TPS when available.
+The preview window appears after generation and before paste. It only shows the replacement text, not the original selection. `Replace` pastes the current preview text, including any manual edits. `Cancel` restores the clipboard snapshot and does not paste anything into the target app. The status line shows local telemetry such as generation time, output tokens, prompt tokens, endpoint, decode TPS, wall TPS, and prompt TPS when available.
 
 ## Uninstall
 
