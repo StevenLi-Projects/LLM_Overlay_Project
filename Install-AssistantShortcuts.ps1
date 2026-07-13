@@ -10,9 +10,9 @@ if (!$Desktop -and !$Startup) {
     $Desktop = $true
 }
 
-$launcher = Join-Path $PSScriptRoot "Launch-Assistant.vbs"
-if (!(Test-Path -LiteralPath $launcher)) {
-    throw "Missing launcher: $launcher"
+$app = Join-Path $PSScriptRoot "dist\LocalTextFormattingAssistant.exe"
+if (!(Test-Path -LiteralPath $app)) {
+    throw "Compiled app not found: $app. Publish the app before installing shortcuts."
 }
 
 $shell = New-Object -ComObject WScript.Shell
@@ -29,10 +29,10 @@ function New-AssistantShortcut {
 
     $path = Join-Path $Folder $Name
     $shortcut = $shell.CreateShortcut($path)
-    $shortcut.TargetPath = "$env:WINDIR\System32\wscript.exe"
-    $shortcut.Arguments = "`"$launcher`""
+    $shortcut.TargetPath = $app
+    $shortcut.Arguments = "--config `"$(Join-Path $PSScriptRoot 'config.json')`""
     $shortcut.WorkingDirectory = $PSScriptRoot
-    $shortcut.IconLocation = "$env:SystemRoot\System32\shell32.dll,70"
+    $shortcut.IconLocation = "$app,0"
     $shortcut.Description = "Launch the local llama.cpp text formatting tray assistant"
     $shortcut.Save()
 
@@ -48,4 +48,4 @@ if ($Startup) {
 }
 
 Write-Host ""
-Write-Host "Done. Shortcuts launch the assistant hidden; use the tray icon to exit."
+Write-Host "Done. Shortcuts launch the compiled tray assistant directly; use the tray icon to exit."

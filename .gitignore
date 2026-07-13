@@ -1,3 +1,8 @@
 *.gguf
 models/
 llama-b*-bin-*/
+llama-turboquant-*/
+*.lnk
+src/**/bin/
+src/**/obj/
+dist/*.pdb

@@ -12,6 +12,14 @@ function Resolve-LocalPath {
     return (Join-Path $PSScriptRoot $PathValue)
 }
 
+function Resolve-SpeculativePaths {
+    param([object]$Speculative)
+
+    if ($Speculative -and ($Speculative.PSObject.Properties.Name -contains "draft_model_path")) {
+        $Speculative.draft_model_path = Resolve-LocalPath $Speculative.draft_model_path
+    }
+}
+
 function Get-PropertyValue {
     param(
         [object]$Object,
@@ -22,6 +30,21 @@ function Get-PropertyValue {
         return $Object.$Name
     }
     return $Default
+}
+
+function Get-PropertyDouble {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [double]$Default = 0.0
+    )
+    $value = Get-PropertyValue -Object $Object -Name $Name -Default $null
+    if ($null -eq $value) { return $Default }
+    try {
+        return [double]$value
+    } catch {
+        return $Default
+    }
 }
 
 function Set-ObjectProperty {
@@ -52,10 +75,45 @@ function Apply-LlamaProfile {
     }
 
     $profile = $Config.llama.profiles.$profileName
-    foreach ($name in @("model_path", "model_name", "context_size", "gpu_layers", "server_args")) {
+    foreach ($name in @("model_path", "model_name", "context_size", "gpu_layers", "server_args", "speculative")) {
         if ($profile.PSObject.Properties.Name -contains $name) {
             Set-ObjectProperty -Object $Config.llama -Name $name -Value $profile.$name
         }
+    }
+    if (!($profile.PSObject.Properties.Name -contains "speculative") -and
+        !($Config.llama.PSObject.Properties.Name -contains "speculative")) {
+        Set-ObjectProperty -Object $Config.llama -Name "speculative" -Value ([pscustomobject]@{ enabled = $false })
+    }
+}
+
+function Get-ConfiguredDraftModelPath {
+    param([object]$Config)
+
+    $speculative = Get-PropertyValue -Object $Config.llama -Name "speculative" -Default $null
+    if ($speculative -and (Get-ConfigBool -Object $speculative -Name "enabled" -Default $false)) {
+        return [string](Get-PropertyValue -Object $speculative -Name "draft_model_path" -Default "")
+    }
+    return ""
+}
+
+function Test-LlamaServerHelpFlag {
+    param(
+        [object]$Config,
+        [string]$Flag
+    )
+
+    $exe = Join-Path $Config.llama.cpp_dir "llama-server.exe"
+    if (!(Test-Path -LiteralPath $exe)) { return $false }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $help = & $exe --help 2>&1 | Out-String
+        return ($help -match [regex]::Escape($Flag))
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
     }
 }
 
@@ -94,6 +152,94 @@ function Get-LlamaServerArgs {
         }
     } elseif ($preferGpu -and !$gpuAvailable) {
         Write-Warning "No llama.cpp GPU device detected; starting with CPU fallback."
+    }
+
+    $speculative = Get-PropertyValue -Object $Config.llama -Name "speculative" -Default $null
+    if ($speculative -and (Get-ConfigBool -Object $speculative -Name "enabled" -Default $false)) {
+        $draftModelPath = [string](Get-PropertyValue -Object $speculative -Name "draft_model_path" -Default "")
+        if ([string]::IsNullOrWhiteSpace($draftModelPath)) {
+            throw "Speculative decoding is enabled, but llama.speculative.draft_model_path is empty."
+        }
+        if (!(Test-Path -LiteralPath $draftModelPath)) {
+            throw "Speculative draft model not found: $draftModelPath"
+        }
+
+        $specType = [string](Get-PropertyValue -Object $speculative -Name "type" -Default "gemma4_mtp")
+        if ($specType -eq "gemma4_mtp") {
+            $supportsAtomicMtp = Test-LlamaServerHelpFlag -Config $Config -Flag "--mtp-head"
+            $supportsMainlineMtp = (Test-LlamaServerHelpFlag -Config $Config -Flag "draft-mtp") -and
+                (Test-LlamaServerHelpFlag -Config $Config -Flag "--spec-draft-model")
+            if (!($supportsAtomicMtp -or $supportsMainlineMtp)) {
+                $fallback = Get-ConfigBool -Object $speculative -Name "fallback_without_support" -Default $true
+                if ($fallback) {
+                    Write-Warning "Gemma 4 MTP is configured, but this llama.cpp build exposes neither draft-mtp nor --mtp-head. Starting without speculative decoding."
+                    return $args
+                }
+                throw "Gemma 4 MTP needs a llama.cpp build with draft-mtp or --mtp-head support."
+            }
+
+            if ($supportsMainlineMtp) {
+                $args += @("--spec-draft-model", $draftModelPath, "--spec-type", "draft-mtp")
+                $draftNMax = Get-ConfigInt -Object $speculative -Name "draft_n_max" -Default 4
+                $draftNMin = Get-ConfigInt -Object $speculative -Name "draft_n_min" -Default 1
+                $draftPMin = Get-PropertyDouble -Object $speculative -Name "draft_p_min" -Default 0.75
+                $args += @("--spec-draft-n-max", ([string]$draftNMax), "--spec-draft-n-min", ([string]$draftNMin), "--spec-draft-p-min", ([string]$draftPMin))
+            } else {
+                $args += @("--mtp-head", $draftModelPath, "--spec-type", "mtp")
+                $draftBlockSize = Get-ConfigInt -Object $speculative -Name "draft_block_size" -Default 2
+                if ($draftBlockSize -gt 0) {
+                    $args += @("--draft-block-size", ([string]$draftBlockSize))
+                }
+            }
+
+            $draftGpuLayers = Get-ConfigInt -Object $speculative -Name "draft_gpu_layers" -Default $effectiveGpuLayers
+            if (!($preferGpu -and $gpuAvailable)) {
+                $draftGpuLayers = 0
+            }
+            $args += @("--n-gpu-layers-draft", ([string]$draftGpuLayers))
+
+            if ($preferGpu -and $gpuAvailable -and $draftGpuLayers -gt 0) {
+                $draftDevice = [string](Get-PropertyValue -Object $speculative -Name "draft_gpu_device" -Default (Get-PropertyValue -Object $Config.llama -Name "gpu_device" -Default ""))
+                if (![string]::IsNullOrWhiteSpace($draftDevice)) {
+                    $args += @($(if ($supportsMainlineMtp) { "--spec-draft-device" } else { "--device-draft" }), $draftDevice)
+                }
+            }
+        } else {
+            $draftGpuLayers = Get-ConfigInt -Object $speculative -Name "draft_gpu_layers" -Default $effectiveGpuLayers
+            if (!($preferGpu -and $gpuAvailable)) {
+                $draftGpuLayers = 0
+            }
+
+            $args += @("--model-draft", $draftModelPath)
+            $args += @("--n-gpu-layers-draft", ([string]$draftGpuLayers))
+
+            if ($preferGpu -and $gpuAvailable -and $draftGpuLayers -gt 0) {
+                $draftDevice = [string](Get-PropertyValue -Object $speculative -Name "draft_gpu_device" -Default (Get-PropertyValue -Object $Config.llama -Name "gpu_device" -Default ""))
+                if (![string]::IsNullOrWhiteSpace($draftDevice)) {
+                    $args += @("--device-draft", $draftDevice)
+                }
+            }
+
+            $draftContextSize = Get-ConfigInt -Object $speculative -Name "draft_context_size" -Default 0
+            if ($draftContextSize -gt 0) {
+                $args += @("--ctx-size-draft", ([string]$draftContextSize))
+            }
+
+            $draftNMax = Get-ConfigInt -Object $speculative -Name "draft_n_max" -Default 0
+            if ($draftNMax -gt 0) {
+                $args += @("--spec-draft-n-max", ([string]$draftNMax))
+            }
+
+            $draftNMin = Get-ConfigInt -Object $speculative -Name "draft_n_min" -Default 0
+            if ($draftNMin -gt 0) {
+                $args += @("--spec-draft-n-min", ([string]$draftNMin))
+            }
+
+            $draftPMin = Get-PropertyDouble -Object $speculative -Name "draft_p_min" -Default -1.0
+            if ($draftPMin -ge 0.0) {
+                $args += @("--spec-draft-p-min", ([string]$draftPMin))
+            }
+        }
     }
 
     $extraArgs = Get-PropertyValue -Object $Config.llama -Name "server_args" -Default @()
@@ -140,7 +286,7 @@ function Test-LlamaGpuAvailable {
     try {
         $ErrorActionPreference = "Continue"
         $output = & $exe --list-devices 2>&1 | Out-String
-        return ($output -match "(?i)Device\s+\d+:\s+.*(CUDA|NVIDIA|GeForce|RTX|Vulkan|SYCL|Metal)")
+        return ($output -match "(?im)^\s*(?:(?:CUDA|Vulkan|SYCL|Metal)\d*\s*:|Device\s+\d+:.*(?:CUDA|NVIDIA|GeForce|RTX|Vulkan|SYCL|Metal))")
     } catch {
         Write-Warning "Could not query llama.cpp devices: $($_.Exception.Message)"
         return $false
@@ -170,10 +316,16 @@ $config.llama.cpp_dir = Resolve-LocalPath $config.llama.cpp_dir
 if ($config.llama.PSObject.Properties.Name -contains "model_path") {
     $config.llama.model_path = Resolve-LocalPath $config.llama.model_path
 }
+if ($config.llama.PSObject.Properties.Name -contains "speculative") {
+    Resolve-SpeculativePaths -Speculative $config.llama.speculative
+}
 if ($config.llama.PSObject.Properties.Name -contains "profiles") {
     foreach ($profile in $config.llama.profiles.PSObject.Properties) {
         if ($profile.Value.PSObject.Properties.Name -contains "model_path") {
             $profile.Value.model_path = Resolve-LocalPath $profile.Value.model_path
+        }
+        if ($profile.Value.PSObject.Properties.Name -contains "speculative") {
+            Resolve-SpeculativePaths -Speculative $profile.Value.speculative
         }
     }
     Apply-LlamaProfile -Config $config
@@ -182,6 +334,10 @@ if ($config.llama.PSObject.Properties.Name -contains "profiles") {
 $exe = Join-Path $config.llama.cpp_dir "llama-server.exe"
 if (!(Test-Path -LiteralPath $exe)) { throw "llama-server.exe not found: $exe" }
 if (!(Test-Path -LiteralPath $config.llama.model_path)) { throw "Model not found: $($config.llama.model_path)" }
+$draftModelPath = Get-ConfiguredDraftModelPath -Config $config
+if (![string]::IsNullOrWhiteSpace($draftModelPath) -and !(Test-Path -LiteralPath $draftModelPath)) {
+    throw "Speculative draft model not found: $draftModelPath"
+}
 Assert-LlamaGpuAvailable -Config $config
 
 $zone = Get-Item -LiteralPath $exe -Stream Zone.Identifier -ErrorAction SilentlyContinue
